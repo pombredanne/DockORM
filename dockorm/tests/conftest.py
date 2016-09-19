@@ -2,23 +2,13 @@
 from __future__ import unicode_literals
 
 from docker import Client
+from docker.utils import kwargs_from_env
 from pytest import fixture
 
-from ..container import Container
-from .utils import dockerfile_root
-
-TEST_ORG = 'dockorm_testing'
-TEST_TAG = 'test'
-
-
-def test_container(image, **kwargs):
-    return Container(
-        image=image,
-        build_path=dockerfile_root(image),
-        organization=TEST_ORG,
-        tag=TEST_TAG,
-        **kwargs
-    )
+from .utils import (
+    TEST_ORG,
+    make_container,
+)
 
 
 @fixture(scope='session', autouse=True)
@@ -27,7 +17,7 @@ def clean_test_images(request):
     Automatically clear all test images after each test run.
     """
     def cleanup():
-        client = Client()
+        client = Client(version='auto', **kwargs_from_env())
         test_images = client.images(TEST_ORG + "/*")
         for image in test_images:
             client.remove_image(image)
@@ -37,7 +27,7 @@ def clean_test_images(request):
 
 @fixture
 def busybox(request):
-    bb = test_container('busybox')
+    bb = make_container('busybox')
 
     if not bb.images():
         bb.build(display=False)
@@ -50,6 +40,18 @@ def busybox(request):
     return bb
 
 
+@fixture
+def orphan(request):
+    container = make_container('orphan')
+
+    def clean():
+        container.purge(stop_first=False, remove_volumes=True)
+
+    request.addfinalizer(clean)
+
+    return container
+
+
 @fixture(scope='session', autouse=True)
 def decoy(request):
     """
@@ -57,7 +59,7 @@ def decoy(request):
 
     Ensures that by-name filters correctly ignore differently-named containers.
     """
-    bb = test_container('busybox_decoy')
+    bb = make_container('busybox_decoy')
     if not bb.images():
         bb.build(display=False)
 

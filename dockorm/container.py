@@ -6,26 +6,23 @@ from __future__ import print_function, unicode_literals
 from itertools import chain
 import json
 from subprocess import call
-import sys
 
 from docker import Client
 from docker.utils import kwargs_from_env
 from six import (
     iteritems,
-    iterkeys,
     itervalues,
+    string_types,
     text_type,
 )
 
-from IPython.utils.py3compat import string_types
 
-from IPython.utils.traitlets import (
+from traitlets import (
     Any,
     Dict,
     HasTraits,
     Instance,
     List,
-    Type,
     Unicode,
     TraitError,
 )
@@ -35,13 +32,19 @@ from .py3compat_utils import strict_map
 
 def print_build_output(build_output):
     success = True
-    for raw_message in build_output:
-        message = json.loads(raw_message)
-        try:
-            print(message['stream'], end="")
-        except KeyError:
-            success = False
-            print(message['error'])
+    for raw_messages in build_output:
+        for raw_message in raw_messages.splitlines():
+            message = json.loads(raw_message.decode('ascii'))
+            if 'stream' in message:
+                print(message['stream'], end="")
+            elif 'status' in message:
+                print(message['status'])
+            elif 'error' in message:
+                success = False
+                print(message['error'])
+            else:
+                success = False
+                print("Unknown message during build: %s" % message)
     return success
 
 
@@ -53,10 +56,25 @@ def scalar(l):
     return l[0]
 
 
+class UnicodeOrFalse(Unicode):
+    info_text = 'a unicode string or False'
+
+    def validate(self, obj, value):
+        if value is False:
+            return value
+        return super(UnicodeOrFalse, self).validate(obj, value)
+
+
 class Container(HasTraits):
     """
     A specification for creation of a container.
     """
+
+    def __str__(self):
+        return (
+            "Container(name={self.name!r}, "
+            "image={self.image!r})".format(self=self)
+        )
 
     organization = Unicode()
 
@@ -95,6 +113,8 @@ class Container(HasTraits):
 
     volumes_readonly = Dict()
 
+    volumes_no_bind = List()
+
     @property
     def volume_mount_points(self):
         """
@@ -109,6 +129,7 @@ class Container(HasTraits):
             chain(
                 itervalues(self.volumes_readwrite),
                 itervalues(self.volumes_readonly),
+                self.volumes_no_bind,
             )
         )
 
@@ -134,28 +155,102 @@ class Container(HasTraits):
         volumes.update(ro_volumes)
         return volumes
 
-    ports = Dict(help="Map from container port -> host port.")
-
-    @property
-    def open_container_ports(self):
-        return strict_map(int, iterkeys(self.ports))
+    ports = Dict(
+        help="Map from container port -> host port. "
+        "See http://docker-py.readthedocs.org/en/latest/port-bindings/."
+    )
 
     @property
     def port_bindings(self):
         out = {}
-        for key, value in self.ports:
-            if isinstance(ports, (list, tuple)):
+        for key, value in iteritems(self.ports):
+            if isinstance(key, tuple):
+                # Convert (1111, 'udp') -> '1111/udp'
                 key = '/'.join(strict_map(text_type, key))
             out[key] = value
         return out
 
+    @property
+    def open_container_ports(self):
+        out = []
+        for key in self.ports:
+            if isinstance(key, int):
+                to_append = key
+            elif isinstance(key, string_types):
+                to_append = int(key)
+            elif isinstance(key, tuple):
+                to_append = key[0]
+            else:
+                raise TypeError("Couldn't understand port key %s" % key)
+            out.append(to_append)
+        return out
+
     environment = Dict()
+
+    network_mode = Unicode(
+        default_value="bridge",
+        help="network_mode for start",
+    )
+
+    extra_hosts = Dict(
+        help="Extra entries for container /etc/hosts",
+    )
+
+    volumes_from = List(
+        trait=Unicode(),
+        default_value=[],
+        help="Container IDs from which to mount volumes."
+    )
+
+    def _make_host_config(self):
+        return self.client.create_host_config(
+            binds=self.volume_binds,
+            port_bindings=self.port_bindings,
+            network_mode=self.network_mode,
+            extra_hosts=self.extra_hosts,
+            volumes_from=self.volumes_from,
+            # TODO: Support all of these.
+            lxc_conf=None,
+            publish_all_ports=False,
+            links=None,
+            privileged=False,
+            dns=None,
+            dns_search=None,
+            restart_policy=None,
+            cap_add=None,
+            cap_drop=None,
+            devices=None,
+            read_only=None,
+            pid_mode=None,
+            ipc_mode=None,
+            security_opt=None,
+            ulimits=None,
+            log_config=None,
+        )
 
     # This should really be something like:
     # Either(Instance(str), List(Instance(str)))
     command = Any()
 
-    client = Instance(Client, kw=kwargs_from_env())
+    tls_assert_hostname = UnicodeOrFalse(
+        default_value=None, allow_none=True, config=True,
+        help="If False, do not verify hostname of docker daemon",
+    )
+
+    _client = None
+
+    @property
+    def client(self):
+        if self._client is None:
+            self._client = Client(
+                version='auto',
+                **kwargs_from_env(assert_hostname=self.tls_assert_hostname)
+            )
+        return self._client
+
+    @client.setter
+    def client(self, value):
+        self._client = value
 
     def build(self, tag=None, display=True, rm=True):
         """
@@ -172,8 +267,7 @@ class Container(HasTraits):
             rm=rm,
         )
         if display:
-            print_build_output(output)
-            return None
+            return print_build_output(output)
         else:
             return list(output)
 
@@ -194,22 +288,17 @@ class Container(HasTraits):
             detach=not attach,
             stdin_open=attach,
             tty=attach,
-            command=command,
+            command=command or self.command,
             environment=self.environment,
+            host_config=self._make_host_config(),
         )
 
-        self.client.start(
-            container,
-            binds=self.volume_binds,
-            port_bindings=self.ports,
-            links=self.format_links(),
-        )
+        self.client.start(container)
 
         if attach:
             call(['docker', 'attach', self.name])
             if rm:
                 self.client.remove_container(self.name)
-
 
     def _matches(self, container):
         return '/' + self.name in container['Names']
